@@ -1,0 +1,49 @@
+name: trustunnel_pc
+description: TrustTunnel Desktop Client - VPN manager for TrustTunnel protocol
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_riverpod: ^2.6.1
+
+  # Storage
+  shared_preferences: ^2.3.3
+
+  # File system
+  path_provider: ^2.1.5
+  file_picker: ^8.1.3
+
+  # Parsing
+  yaml: ^3.1.2
+  http: ^1.2.2
+  archive: ^4.0.9
+
+  # UI
+  google_fonts: ^6.2.1
+  flutter_animate: ^4.5.2
+  window_manager: ^0.4.3
+  qr_flutter: ^4.1.0
+
+  # Utils
+  uuid: ^4.5.1
+  intl: ^0.20.2
+  socks5_proxy: ^2.1.1
+  tray_manager: ^0.5.0
+  launch_at_startup: ^0.5.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icons/
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
