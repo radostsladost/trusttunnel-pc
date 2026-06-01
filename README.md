@@ -5,7 +5,17 @@ Wraps the official [`trusttunnel_client`](https://github.com/TrustTunnel/TrustTu
 
 > **Supported platforms:** Linux · macOS · Windows
 
+
+![screenshot](https://github.com/radostsladost/trusttunnel-pc/raw/refs/heads/main/screenshot.webp)
+
+
 ---
+
+## Download
+
+- [Windows](https://github.com/radostsladost/trusttunnel-pc/releases/download/v1.0.1/TrustTunnel-win-x64.zip)
+- [Debian/Ubuntu .deb package](https://github.com/radostsladost/trusttunnel-pc/releases/download/v1.0.1/trusttunnel-desktop-1.0.0-amd64.deb)
+- [Sources](https://github.com/radostsladost/trusttunnel-pc/releases)
 
 ## Features
 
