@@ -31,6 +31,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   bool _proxyControllersInitialized = false;
 
   bool _autostartEnabled = false;
+  bool _autoConnectEnabled = false;
   String? _globalRoutesFile;
   bool _settingsLoaded = false;
 
@@ -51,10 +52,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   Future<void> _loadExtraSettings() async {
     final autostart = await AutostartService.isEnabled();
+    final autoConnect = await StorageService.loadAutoConnect();
     final routesFile = await StorageService.loadGlobalRoutesFile();
     if (mounted) {
       setState(() {
         _autostartEnabled = autostart;
+        _autoConnectEnabled = autoConnect;
         _globalRoutesFile = routesFile;
         _settingsLoaded = true;
       });
@@ -356,11 +359,59 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                         onChanged: _settingsLoaded
                             ? (v) async {
                                 await AutostartService.setEnabled(v);
+                                // Turning off autostart also turns off
+                                // auto-connect to avoid orphaned setting.
+                                if (!v && _autoConnectEnabled) {
+                                  await StorageService.saveAutoConnect(false);
+                                  setState(() => _autoConnectEnabled = false);
+                                }
                                 setState(() => _autostartEnabled = v);
                               }
                             : null,
                       ),
                     ],
+                  ),
+
+                  // Sub-option: auto-connect (only meaningful when autostart is on)
+                  AnimatedCrossFade(
+                    duration: const Duration(milliseconds: 200),
+                    crossFadeState: _autostartEnabled
+                        ? CrossFadeState.showFirst
+                        : CrossFadeState.showSecond,
+                    firstChild: Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              const SizedBox(width: 16),
+                              const Icon(Icons.bolt_rounded,
+                                  color: AppTheme.textSecondary, size: 16),
+                              const SizedBox(width: 8),
+                              const Text(
+                                'Auto-connect on launch',
+                                style: TextStyle(
+                                  color: AppTheme.textSecondary,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
+                          ),
+                          Switch(
+                            value: _autoConnectEnabled,
+                            activeThumbColor: AppTheme.secondary,
+                            onChanged: _settingsLoaded
+                                ? (v) async {
+                                    await StorageService.saveAutoConnect(v);
+                                    setState(() => _autoConnectEnabled = v);
+                                  }
+                                : null,
+                          ),
+                        ],
+                      ),
+                    ),
+                    secondChild: const SizedBox.shrink(),
                   ),
                 ],
               ),

@@ -107,6 +107,22 @@ class StorageService {
   }
 
   // ---------------------------------------------------------------------------
+  // Auto-connect on launch
+  // ---------------------------------------------------------------------------
+
+  static const String _autoConnectKey = 'tt_auto_connect';
+
+  static Future<bool> loadAutoConnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_autoConnectKey) ?? false;
+  }
+
+  static Future<void> saveAutoConnect(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_autoConnectKey, value);
+  }
+
+  // ---------------------------------------------------------------------------
   // Global DNS routes file
   // ---------------------------------------------------------------------------
 

@@ -5,7 +5,10 @@ import 'package:window_manager/window_manager.dart';
 import 'theme/app_theme.dart';
 import 'providers/app_providers.dart';
 import 'providers/connection_provider.dart';
+import 'providers/installer_provider.dart';
 import 'providers/ip_provider.dart';
+import 'providers/profiles_provider.dart';
+import 'services/storage_service.dart';
 import 'services/tray_service.dart';
 import 'screens/home_screen.dart';
 import 'screens/profiles_screen.dart';
@@ -35,6 +38,8 @@ class _TrustTunnelAppState extends ConsumerState<TrustTunnelApp> {
       setState(() => _initialized = true);
       // Initialize system tray after all providers are ready.
       await TrayService.instance.initialize(ref);
+      // Auto-connect if the user enabled it in Settings.
+      await _maybeAutoConnect();
     });
   }
 
@@ -46,6 +51,27 @@ class _TrustTunnelAppState extends ConsumerState<TrustTunnelApp> {
       debugShowCheckedModeBanner: false,
       home: _initialized ? const MainShell() : const SplashScreen(),
     );
+  }
+
+  Future<void> _maybeAutoConnect() async {
+    final shouldConnect = await StorageService.loadAutoConnect();
+    if (!shouldConnect) return;
+
+    final profile = ref.read(selectedProfileProvider);
+    final binaryPath = ref.read(clientBinaryPathProvider);
+    final installState = ref.read(installerProvider);
+
+    if (profile == null || binaryPath.isEmpty || !installState.isInstalled) {
+      return; // Nothing to connect to — silently skip.
+    }
+
+    try {
+      await ref
+          .read(connectionStatusProvider.notifier)
+          .connect(profile, binaryPath, ref);
+    } catch (_) {
+      // Auto-connect failures are silent; the user can retry from the UI.
+    }
   }
 }
 
