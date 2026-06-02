@@ -50,6 +50,13 @@ class ProcessService {
   Process? _macOsTailProcess; // `tail -F` streaming the elevated binary's log
   String? _macOsLogFilePath; // temp log file written by the elevated binary
 
+  // macOS TUN networking state (routes + DNS managed by this app)
+  String? _macOsTunInterface; // e.g. "utun3"
+  String? _macOsOriginalGateway; // default gw before VPN
+  String? _macOsVpnServerIp; // resolved VPN server IP
+  List<String> _macOsPreExistingUtun = []; // utun ifaces before we started
+  final Map<String, List<String>> _macOsSavedDns = {}; // service→ original DNS
+
   ListenerType? _activeListenerType;
   String _activeSocks5Address = '127.0.0.1:1080';
 
@@ -104,6 +111,11 @@ class ProcessService {
     final needsElevation = profile.listenerType == ListenerType.tun &&
         (Platform.isLinux || Platform.isMacOS);
 
+    // Snapshot existing utun interfaces so we can identify the new one later.
+    if (needsElevation && Platform.isMacOS) {
+      _macOsPreExistingUtun = await _listUtunInterfaces();
+    }
+
     if (needsElevation && Platform.isLinux) {
       await _startWithLinuxWrapper(binaryPath);
     } else if (needsElevation && Platform.isMacOS) {
@@ -118,6 +130,14 @@ class ProcessService {
     // Set system proxy when in SOCKS5 mode.
     if (profile.listenerType == ListenerType.socks5) {
       await _setSystemProxy(_activeSocks5Address).catchError((_) {});
+    }
+
+    // On macOS TUN mode: detect the new utun interface, apply routes if the
+    // binary didn't, and update system DNS so queries go through the tunnel.
+    if (profile.listenerType == ListenerType.tun && Platform.isMacOS) {
+      await _setupMacOsTunNetworking(profile).catchError((Object e) {
+        _log('[APP] TUN network setup warning: $e');
+      });
     }
   }
 
@@ -149,6 +169,11 @@ class ProcessService {
     // browser stops using the proxy as soon as they disconnect.
     if (listenerType == ListenerType.socks5) {
       await _clearSystemProxy().catchError((_) {});
+    }
+
+    // On macOS TUN mode: restore DNS and remove routes we may have added.
+    if (listenerType == ListenerType.tun && Platform.isMacOS) {
+      await _teardownMacOsTunNetworking().catchError((_) {});
     }
 
     _log('[APP] Stopping VPN process...');
@@ -524,6 +549,263 @@ wait "\$CHILD_PID"
           .catchError((Object _) => File(_macOsLogFilePath!));
       _macOsLogFilePath = null;
     }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Private – macOS TUN networking (interface detection, routes, DNS)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Returns the names of all utun interfaces currently visible to ifconfig.
+  Future<List<String>> _listUtunInterfaces() async {
+    try {
+      final r = await Process.run(
+          'sh', ['-c', "ifconfig | awk -F: '/^utun/{print \$1}'"]);
+      return (r.stdout as String)
+          .split('\n')
+          .map((s) => s.trim())
+          .where((s) => s.startsWith('utun'))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Polls for up to 4 s for a utun interface that wasn't in
+  /// [_macOsPreExistingUtun], returning its name or empty string.
+  Future<String> _findNewUtunInterface() async {
+    for (var i = 0; i < 8; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      final current = await _listUtunInterfaces();
+      for (final iface in current) {
+        if (!_macOsPreExistingUtun.contains(iface)) return iface;
+      }
+    }
+    return '';
+  }
+
+  /// Runs [shellCmd] via `osascript do shell script … with administrator
+  /// privileges`.  macOS caches the auth from the initial binary start so
+  /// this rarely shows a password prompt.
+  Future<ProcessResult> _runElevated(String shellCmd) {
+    final escaped = shellCmd.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
+    return Process.run(
+      'osascript',
+      ['-e', 'do shell script "$escaped" with administrator privileges'],
+    ).catchError((_) => ProcessResult(0, 1, '', ''));
+  }
+
+  /// Returns true if the kernel routing table already has a default-like
+  /// route pointing at [iface] (meaning the binary set it up itself).
+  Future<bool> _hasUtunDefaultRoute(String iface) async {
+    try {
+      final r = await Process.run('netstat', ['-rn', '-f', 'inet']);
+      final lines = (r.stdout as String).split('\n');
+      // Look for a 0/1 or default route through this interface.
+      return lines.any((l) =>
+          l.contains(iface) &&
+          (l.startsWith('0/1') ||
+              l.startsWith('128/1') ||
+              l.startsWith('0.0.0.0')));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Full macOS TUN post-connect setup:
+  ///   1. Detect the utun interface the binary created.
+  ///   2. Add split-default routes (0/1 + 128/1) if the binary didn't.
+  ///   3. Set system DNS on every active network service.
+  ///   4. Log diagnostic snapshot.
+  Future<void> _setupMacOsTunNetworking(TrustTunnelProfile profile) async {
+    _log('[APP] Configuring macOS network for TUN mode…');
+
+    // 1. Find the new utun interface.
+    _macOsTunInterface = await _findNewUtunInterface();
+    if (_macOsTunInterface == null || _macOsTunInterface!.isEmpty) {
+      _log('[APP] Warning: no new utun interface detected – '
+          'the binary may have failed silently.');
+      _macOsTunInterface = null;
+    } else {
+      _log('[APP] TUN interface detected: $_macOsTunInterface');
+    }
+
+    // 2. Resolve original default gateway (needed for the server-IP exception
+    //    route and for route teardown).
+    try {
+      final r = await Process.run('sh', [
+        '-c',
+        "route -n get default 2>/dev/null | awk '/gateway:/{print \$2}'"
+      ]);
+      _macOsOriginalGateway = (r.stdout as String).trim();
+      if (_macOsOriginalGateway!.isNotEmpty) {
+        _log('[APP] Original default gateway: $_macOsOriginalGateway');
+      }
+    } catch (_) {}
+
+    // 3. Resolve the VPN server IP (to protect it from the tunnel route).
+    _macOsVpnServerIp = await _resolveVpnServerIp(profile);
+    if (_macOsVpnServerIp != null) {
+      _log('[APP] VPN server IP: $_macOsVpnServerIp');
+    }
+
+    // 4. Apply routes only if the binary hasn't done it already.
+    final iface = _macOsTunInterface;
+    if (iface != null) {
+      final alreadyRouted = await _hasUtunDefaultRoute(iface);
+      if (!alreadyRouted) {
+        _log('[APP] Binary did not set default routes – applying manually…');
+        await _applyMacOsTunRoutes(iface);
+      } else {
+        _log('[APP] Default routes already in place via $iface.');
+      }
+    }
+
+    // 5. Update system DNS so queries go through the VPN DNS upstreams.
+    if (profile.dnsUpstreams.isNotEmpty) {
+      await _applyMacOsDns(profile.dnsUpstreams);
+    } else {
+      _log('[APP] No DNS upstreams in profile – system DNS unchanged.');
+    }
+
+    // 6. Log a quick diagnostic snapshot.
+    _logMacOsNetDiag();
+  }
+
+  /// Applies split-default routes through [iface], plus a host route for the
+  /// VPN server itself so it still reaches the real gateway.
+  Future<void> _applyMacOsTunRoutes(String iface) async {
+    final cmds = <String>[];
+
+    // Server exception route: VPN server traffic must NOT go through the
+    // tunnel, otherwise we create a routing loop.
+    final serverIp = _macOsVpnServerIp;
+    final gw = _macOsOriginalGateway;
+    if (serverIp != null && gw != null && gw.isNotEmpty) {
+      cmds.add('route add -host $serverIp $gw 2>/dev/null || true');
+    }
+
+    // Split-default: 0/1 + 128/1 together cover the entire IPv4 space and
+    // take precedence over the existing 0/0 default via the physical interface.
+    cmds.add(
+        'route add -net 0.0.0.0/1   -interface $iface 2>/dev/null || true');
+    cmds.add(
+        'route add -net 128.0.0.0/1 -interface $iface 2>/dev/null || true');
+
+    final result = await _runElevated(cmds.join(' && '));
+    if (result.exitCode == 0) {
+      _log('[APP] Routes applied: 0/1 + 128/1 → $iface');
+    } else {
+      _log('[APP] Route setup warning (exit ${result.exitCode}): '
+          '${result.stderr}');
+    }
+  }
+
+  /// Resolves the VPN server to an IPv4 address.  Prefers an address already
+  /// in the profile, falls back to DNS lookup of the hostname.
+  Future<String?> _resolveVpnServerIp(TrustTunnelProfile profile) async {
+    for (final addr in profile.addresses) {
+      if (RegExp(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\$').hasMatch(addr)) {
+        return addr;
+      }
+    }
+    try {
+      final addrs = await InternetAddress.lookup(
+        profile.hostname,
+        type: InternetAddressType.IPv4,
+      );
+      if (addrs.isNotEmpty) return addrs.first.address;
+    } catch (_) {}
+    return null;
+  }
+
+  /// Sets the DNS servers for every active macOS network service to [servers],
+  /// first saving the originals so they can be restored on disconnect.
+  Future<void> _applyMacOsDns(List<String> servers) async {
+    _macOsSavedDns.clear();
+
+    final listR =
+        await Process.run('networksetup', ['-listallnetworkservices']);
+    final services = (listR.stdout as String)
+        .split('\n')
+        .map((s) => s.trim())
+        .where((s) =>
+            s.isNotEmpty &&
+            !s.contains('*') &&
+            !s.toLowerCase().contains('asterisk'))
+        .toList();
+
+    final dnsArgs = servers.join(' ');
+    for (final service in services) {
+      // Save current DNS.
+      final dnsR =
+          await Process.run('networksetup', ['-getdnsservers', service]);
+      final out = (dnsR.stdout as String).trim();
+      _macOsSavedDns[service] = out.toLowerCase().contains("there aren't")
+          ? []
+          : out
+              .split('\n')
+              .map((s) => s.trim())
+              .where((s) => s.isNotEmpty)
+              .toList();
+
+      // Set new DNS (needs root).
+      final svcEsc = service.replaceAll('"', r'\"');
+      await _runElevated('networksetup -setdnsservers "$svcEsc" $dnsArgs');
+    }
+    _log('[APP] DNS set to: ${servers.join(', ')} '
+        'for ${services.length} network service(s).');
+  }
+
+  /// Restores each network service's DNS to what it was before the VPN
+  /// connected, then clears the saved state.
+  Future<void> _restoreMacOsDns() async {
+    if (_macOsSavedDns.isEmpty) return;
+    for (final entry in _macOsSavedDns.entries) {
+      final svcEsc = entry.key.replaceAll('"', r'\"');
+      final arg = entry.value.isEmpty ? 'empty' : entry.value.join(' ');
+      await _runElevated('networksetup -setdnsservers "$svcEsc" $arg');
+    }
+    _macOsSavedDns.clear();
+    _log('[APP] DNS restored to pre-VPN settings.');
+  }
+
+  /// Removes the routes and DNS changes made by [_setupMacOsTunNetworking].
+  Future<void> _teardownMacOsTunNetworking() async {
+    final iface = _macOsTunInterface;
+    final serverIp = _macOsVpnServerIp;
+
+    if (iface != null && iface.isNotEmpty) {
+      final cmds = [
+        'route delete -net 0.0.0.0/1   -interface $iface 2>/dev/null || true',
+        'route delete -net 128.0.0.0/1 -interface $iface 2>/dev/null || true',
+        if (serverIp != null)
+          'route delete -host $serverIp 2>/dev/null || true',
+      ];
+      await _runElevated(cmds.join(' && '));
+      _log('[APP] TUN routes removed.');
+    }
+
+    await _restoreMacOsDns();
+
+    _macOsTunInterface = null;
+    _macOsOriginalGateway = null;
+    _macOsVpnServerIp = null;
+    _macOsPreExistingUtun = [];
+  }
+
+  /// Logs a quick network snapshot to the log stream (non-blocking).
+  void _logMacOsNetDiag() {
+    Future(() async {
+      try {
+        // Active utun interfaces
+        final utunR = await Process.run('sh',
+            ['-c', "ifconfig | awk '/^utun/{p=1} p{print; if(/^\$/)p=0}'"]);
+        _log('[DIAG] TUN interfaces:\n${(utunR.stdout as String).trim()}');
+        // IPv4 routing table
+        final routeR = await Process.run('netstat', ['-rn', '-f', 'inet']);
+        _log('[DIAG] IPv4 routing table:\n${(routeR.stdout as String).trim()}');
+      } catch (_) {}
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
