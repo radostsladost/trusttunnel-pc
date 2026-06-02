@@ -51,6 +51,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   Future<void> _loadExtraSettings() async {
+    // isEnabled() already catches its own errors and returns false, so
+    // _settingsLoaded is always set to true even when autostart is unavailable.
     final autostart = await AutostartService.isEnabled();
     final autoConnect = await StorageService.loadAutoConnect();
     final routesFile = await StorageService.loadGlobalRoutesFile();
@@ -358,14 +360,27 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                         activeThumbColor: AppTheme.primary,
                         onChanged: _settingsLoaded
                             ? (v) async {
-                                await AutostartService.setEnabled(v);
-                                // Turning off autostart also turns off
-                                // auto-connect to avoid orphaned setting.
-                                if (!v && _autoConnectEnabled) {
-                                  await StorageService.saveAutoConnect(false);
-                                  setState(() => _autoConnectEnabled = false);
+                                try {
+                                  await AutostartService.setEnabled(v);
+                                  // Turning off autostart also turns off
+                                  // auto-connect to avoid orphaned setting.
+                                  if (!v && _autoConnectEnabled) {
+                                    await StorageService.saveAutoConnect(false);
+                                    setState(() => _autoConnectEnabled = false);
+                                  }
+                                  setState(() => _autostartEnabled = v);
+                                } catch (e) {
+                                  if (mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(
+                                            'Could not update autostart: $e'),
+                                        backgroundColor: AppTheme.error,
+                                        duration: const Duration(seconds: 4),
+                                      ),
+                                    );
+                                  }
                                 }
-                                setState(() => _autostartEnabled = v);
                               }
                             : null,
                       ),

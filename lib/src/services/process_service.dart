@@ -16,6 +16,13 @@ import 'toml_service.dart';
 ///   It also writes the child PID to a temp file so we can attempt a direct
 ///   elevated kill as a last resort.
 ///
+/// - **TUN elevation (macOS)**: Uses `osascript do shell script … with
+///   administrator privileges` to show the native password dialog.  The binary
+///   is started in the background via a wrapper script; its output is
+///   redirected to a temp log file and streamed back into [logStream] via
+///   `tail -F`.  The osascript process blocks until the binary exits, giving
+///   us a real sentinel Process for lifecycle tracking.
+///
 /// - **Connection detection**: `start()` listens to log output and resolves
 ///   only when a "ready" indicator is seen (or after a 20-second fallback).
 ///   This prevents the UI from reporting "Connected" before the tunnel is up.
@@ -33,10 +40,15 @@ class ProcessService {
   ProcessService._();
 
   Process? _process;
-  int? _childPid; // PID of trusttunnel_client (not the pkexec wrapper)
+  int?
+      _childPid; // PID of trusttunnel_client (not the pkexec/osascript wrapper)
   String? _wrapperScriptPath;
   String? _pidFilePath;
   String? _configPath;
+
+  // macOS elevated-mode helpers
+  Process? _macOsTailProcess; // `tail -F` streaming the elevated binary's log
+  String? _macOsLogFilePath; // temp log file written by the elevated binary
 
   ListenerType? _activeListenerType;
   String _activeSocks5Address = '127.0.0.1:1080';
@@ -127,6 +139,10 @@ class ProcessService {
     _childPid = null;
     _activeListenerType = null;
 
+    // Stop the macOS log tail immediately.
+    _macOsTailProcess?.kill();
+    _macOsTailProcess = null;
+
     if (process == null) return;
 
     // Clear system proxy synchronously before returning so the user's
@@ -146,6 +162,12 @@ class ProcessService {
       _tryElevatedKill(childPid, force: false);
     }
 
+    // For macOS TUN mode: the binary runs as root independently of the
+    // osascript sentinel process, so we must kill it separately.
+    if (childPid != null && Platform.isMacOS) {
+      _tryMacOsElevatedKill(childPid, force: false);
+    }
+
     // Background cleanup: force-kill after 8 seconds.
     process.exitCode.timeout(const Duration(seconds: 8)).then((_) {
       _log('[APP] Process stopped cleanly.');
@@ -155,6 +177,9 @@ class ProcessService {
       process.kill(); // SIGKILL
       if (childPid != null && Platform.isLinux) {
         _tryElevatedKill(childPid, force: true);
+      }
+      if (childPid != null && Platform.isMacOS) {
+        _tryMacOsElevatedKill(childPid, force: true);
       }
       _cleanUpWrapperFiles();
     });
@@ -244,20 +269,106 @@ wait "\$CHILD_PID"
     _watchExit(_process!);
   }
 
-  /// macOS TUN: uses `osascript` to show the native authentication dialog.
+  /// macOS TUN: uses `osascript` to show the native administrator dialog.
+  ///
+  /// Strategy:
+  ///  1. A tiny sh wrapper is written to /tmp.  It starts the binary in the
+  ///     background, writes its PID, then `wait`s – so osascript (our sentinel
+  ///     Process) stays alive exactly as long as the binary does.
+  ///  2. Binary output is redirected to a temp log file, then tailed via
+  ///     `tail -F` so [_logController] / [_waitForReady] work normally.
+  ///  3. On [stop]: SIGTERM goes to the osascript sentinel AND the real PID is
+  ///     killed via a second osascript call (auth stays cached for ~5 min).
   Future<void> _startWithMacOsElevation(String binaryPath) async {
-    final escapedBinary = binaryPath.replaceAll('"', '\\"');
-    final escapedConfig = _configPath!.replaceAll('"', '\\"');
-    final script =
-        'do shell script "\\"$escapedBinary\\" -c \\"$escapedConfig\\"" '
-        'with administrator privileges';
+    final tmpBase = '/tmp/tt_${DateTime.now().millisecondsSinceEpoch}';
+    _wrapperScriptPath = '${tmpBase}_run.sh';
+    _pidFilePath = '${tmpBase}_pid.txt';
+    _macOsLogFilePath = '$tmpBase.log';
+
+    // Escape a value for embedding inside a shell double-quoted string.
+    // (macOS paths never contain backslashes, but may contain double-quotes
+    //  or spaces – quoting the entire path handles spaces already.)
+    String esc(String s) => s.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
+
+    // Wrapper: start binary in background, save PID, then wait so that the
+    // osascript process (our sentinel) blocks until the binary exits.
+    final wrapperContent = '#!/bin/sh\n'
+        '"${esc(binaryPath)}" -c "${esc(_configPath!)}"'
+        ' >> "${esc(_macOsLogFilePath!)}" 2>&1 &\n'
+        'CHILD=\$!\n'
+        'echo "\$CHILD" > "${esc(_pidFilePath!)}"\n'
+        'wait "\$CHILD"\n';
+    await File(_wrapperScriptPath!).writeAsString(wrapperContent);
+    await Process.run('chmod', ['+x', _wrapperScriptPath!]);
+
+    // Touch the log file before starting so `tail -F` can open it immediately.
+    await File(_macOsLogFilePath!).writeAsString('');
+
+    // Build the AppleScript.  The wrapper path is double-quoted inside the
+    // shell command, which is itself double-quoted inside the AppleScript
+    // string → we escape `"` as `\"` for the AppleScript layer.
+    final escapedWrapper = _wrapperScriptPath!.replaceAll('"', r'\"');
+    final appleScript =
+        'do shell script "\\"$escapedWrapper\\"" with administrator privileges';
+
+    // Process.start returns immediately; the actual dialog is shown by
+    // osascript.  _process stays non-null while the binary is alive.
     _process = await Process.start(
       'osascript',
-      ['-e', script],
+      ['-e', appleScript],
       runInShell: false,
     );
+    // osascript's own stdout/stderr carry minimal info; real output is tailed.
     _pipeOutput(_process!);
     _watchExit(_process!);
+
+    // Give the wrapper script ~400 ms to write the PID file before we read it.
+    await Future.delayed(const Duration(milliseconds: 400));
+    try {
+      final pidStr = await File(_pidFilePath!).readAsString();
+      _childPid = int.tryParse(pidStr.trim());
+      if (_childPid != null) {
+        _log('[APP] Elevated TUN process started (PID: $_childPid)');
+      }
+    } catch (_) {
+      _log('[APP] Elevated TUN process started (PID unknown)');
+    }
+
+    // Stream the binary's log output into _logController so _waitForReady
+    // and the UI log view work as normal.
+    await _startMacOsLogTail(_macOsLogFilePath!);
+  }
+
+  /// Starts `tail -F` on [logFile] and pipes every line into [_logController].
+  Future<void> _startMacOsLogTail(String logFile) async {
+    try {
+      final tailProc = await Process.start('tail', ['-F', '-n', '+1', logFile]);
+      _macOsTailProcess = tailProc;
+      tailProc.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(_log, onError: (_) {}, cancelOnError: false);
+      tailProc.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(
+            (l) => _log('[ERR] $l'),
+            onError: (_) {},
+            cancelOnError: false,
+          );
+    } catch (e) {
+      _log('[APP] Could not start log tail: $e');
+    }
+  }
+
+  /// Kills [pid] (running as root on macOS) via a second `osascript` call.
+  /// macOS caches the user's auth for ~5 minutes, so this rarely re-prompts.
+  void _tryMacOsElevatedKill(int pid, {required bool force}) {
+    final sig = force ? '-9' : '-15';
+    final appleScript = 'do shell script "kill $sig $pid 2>/dev/null; true" '
+        'with administrator privileges';
+    Process.run('osascript', ['-e', appleScript])
+        .catchError((_) => ProcessResult(0, 1, '', ''));
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -363,6 +474,9 @@ wait "\$CHILD_PID"
       if (identical(process, _process)) {
         _process = null;
         _childPid = null;
+        // If the binary exited on its own, clean up the macOS log tail too.
+        _macOsTailProcess?.kill();
+        _macOsTailProcess = null;
       }
     });
   }
@@ -403,6 +517,12 @@ wait "\$CHILD_PID"
           .delete()
           .catchError((Object _) => File(_pidFilePath!));
       _pidFilePath = null;
+    }
+    if (_macOsLogFilePath != null) {
+      File(_macOsLogFilePath!)
+          .delete()
+          .catchError((Object _) => File(_macOsLogFilePath!));
+      _macOsLogFilePath = null;
     }
   }
 

@@ -117,7 +117,16 @@ class InstallerService {
         },
       );
 
-      if (response.statusCode != 200) return null;
+      if (response.statusCode != 200) {
+        final hint = response.statusCode == 403
+            ? ' (rate limit – try again later or check your network)'
+            : response.statusCode == 404
+                ? ' (repository or release not found)'
+                : '';
+        throw Exception(
+          'GitHub API returned HTTP ${response.statusCode}$hint.',
+        );
+      }
 
       final data = json.decode(response.body) as Map<String, dynamic>;
       final assets = data['assets'] as List<dynamic>?;

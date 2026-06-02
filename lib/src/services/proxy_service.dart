@@ -49,13 +49,24 @@ class ProxyService {
         ),
       ]);
     } else {
-      // HTTP CONNECT proxy
-      final userInfo = config.username.isNotEmpty
-          ? '${Uri.encodeComponent(config.username)}:${Uri.encodeComponent(config.password)}@'
-          : '';
-      httpClient.findProxy =
-          (uri) => 'PROXY $userInfo${config.host}:${config.port}';
-      // Accept proxy-injected certificates (common with MITM proxies).
+      // HTTP CONNECT proxy.
+      // Dart's HttpClient does not support credentials embedded in the
+      // findProxy string; use authenticateProxy instead.
+      httpClient.findProxy = (uri) => 'PROXY ${config.host}:${config.port}';
+      if (config.username.isNotEmpty) {
+        final username = config.username;
+        final password = config.password;
+        httpClient.authenticateProxy = (host, port, scheme, realm) async {
+          httpClient.addProxyCredentials(
+            host,
+            port,
+            realm ?? 'Basic',
+            HttpClientBasicCredentials(username, password),
+          );
+          return true;
+        };
+      }
+      // Accept proxy-injected certificates (common with MITM / corporate proxies).
       httpClient.badCertificateCallback = (_, __, ___) => true;
     }
 
