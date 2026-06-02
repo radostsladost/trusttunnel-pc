@@ -212,19 +212,34 @@ class InstallerService {
   }
 
   /// Writes the first matching binary file from [archive] to [destDir].
+  /// On Windows, also extracts wintun.dll if present in the archive.
   static void _writeBinaryFromArchive(Archive archive, String destDir) {
     final name = _binaryName();
+    bool foundBinary = false;
+
     for (final file in archive) {
       if (!file.isFile) continue;
 
       // Strip any leading directory components and compare just the filename.
       final fileName = file.name.split('/').last.split(r'\').last;
+
       if (fileName == name || fileName == 'trusttunnel_client') {
         final outFile = File('$destDir${Platform.pathSeparator}$fileName');
         outFile.writeAsBytesSync(file.content as List<int>);
-        return;
+        foundBinary = true;
+      }
+
+      // On Windows, wintun.dll must sit next to the binary so the TUN
+      // driver can be loaded.  Extract it whenever it appears in the archive.
+      if (Platform.isWindows && fileName == 'wintun.dll') {
+        final outFile = File('$destDir${Platform.pathSeparator}wintun.dll');
+        outFile.writeAsBytesSync(file.content as List<int>);
       }
     }
-    throw Exception('Binary "$name" not found inside the downloaded archive.');
+
+    if (!foundBinary) {
+      throw Exception(
+          'Binary "$name" not found inside the downloaded archive.');
+    }
   }
 }

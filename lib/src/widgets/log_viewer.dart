@@ -139,21 +139,26 @@ class _LogViewerState extends State<LogViewer> {
           Scrollbar(
             controller: _scroll,
             thumbVisibility: true,
-            child: ListView.builder(
+            child: SingleChildScrollView(
               controller: _scroll,
-              itemCount: _lines.length,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              itemBuilder: (_, i) {
-                final line = _lines[i];
-                return SelectableText(
-                  line,
-                  style: GoogleFonts.sourceCodePro(
-                    color: _colorForLine(line),
-                    fontSize: 11,
-                    height: 1.55,
-                  ),
-                );
-              },
+              // A single SelectableText.rich spans all lines, so the user
+              // can drag a selection across multiple log lines at once.
+              child: SelectableText.rich(
+                TextSpan(
+                  children: [
+                    for (final line in _lines)
+                      TextSpan(
+                        text: '$line\n',
+                        style: GoogleFonts.sourceCodePro(
+                          color: _colorForLine(line),
+                          fontSize: 11,
+                          height: 1.55,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             ),
           ),
 

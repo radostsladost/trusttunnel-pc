@@ -4,22 +4,38 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// Extracts bundled icon assets to temp files and caches the paths.
-/// Both tray_manager and window_manager need filesystem paths on Linux.
+/// tray_manager on Windows requires .ico files; PNG works on Linux/macOS.
 class IconService {
   static String? _trayIconPath;
   static String? _appIconPath;
 
-  /// 32×32 PNG for the system tray.
+  /// Icon for the system tray.
+  /// Windows: returns a .ico path (required by tray_manager on Win32).
+  /// Linux/macOS: returns the 32×32 PNG.
   static Future<String> trayIconPath() async {
-    _trayIconPath ??=
-        await _extract('assets/icons/tray_icon.png', 'tt_tray.png');
+    if (_trayIconPath != null) return _trayIconPath!;
+    if (Platform.isWindows) {
+      _trayIconPath =
+          await _extract('assets/icons/app_icon.ico', 'tt_tray.ico');
+    } else {
+      _trayIconPath =
+          await _extract('assets/icons/tray_icon.png', 'tt_tray.png');
+    }
     return _trayIconPath!;
   }
 
-  /// 512×512 PNG for the window/taskbar icon and in-app use.
+  /// Icon for the window title bar / taskbar.
+  /// Windows: returns a .ico path (required by window_manager on Win32).
+  /// Linux/macOS: returns the 512×512 PNG.
   static Future<String> appIconPath() async {
-    _appIconPath ??=
-        await _extract('assets/icons/app_icon.png', 'tt_app_icon.png');
+    if (_appIconPath != null) return _appIconPath!;
+    if (Platform.isWindows) {
+      _appIconPath =
+          await _extract('assets/icons/app_icon.ico', 'tt_app_icon.ico');
+    } else {
+      _appIconPath =
+          await _extract('assets/icons/app_icon.png', 'tt_app_icon.png');
+    }
     return _appIconPath!;
   }
 

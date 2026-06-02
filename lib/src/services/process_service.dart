@@ -116,6 +116,11 @@ class ProcessService {
       _macOsPreExistingUtun = await _listUtunInterfaces();
     }
 
+    // Windows TUN mode: pre-flight checks before attempting to start.
+    if (profile.listenerType == ListenerType.tun && Platform.isWindows) {
+      await _checkWindowsTunPrerequisites(binaryPath);
+    }
+
     if (needsElevation && Platform.isLinux) {
       await _startWithLinuxWrapper(binaryPath);
     } else if (needsElevation && Platform.isMacOS) {
@@ -222,6 +227,52 @@ class ProcessService {
   // ─────────────────────────────────────────────────────────────────────────
   // Private – process launchers
   // ─────────────────────────────────────────────────────────────────────────
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Windows TUN pre-flight checks
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Verifies that the current process has administrator privileges and that
+  /// wintun.dll is present next to the binary.  Throws a human-readable
+  /// [Exception] if either requirement is not met so the UI can surface it.
+  Future<void> _checkWindowsTunPrerequisites(String binaryPath) async {
+    // Check for wintun.dll in the same directory as the binary.
+    final binDir = File(binaryPath).parent.path;
+    final wintunPath = '$binDir${Platform.pathSeparator}wintun.dll';
+    if (!File(wintunPath).existsSync()) {
+      throw Exception(
+        'wintun.dll not found in the TrustTunnel directory.\n'
+        'Please reinstall the client so that wintun.dll is placed next to '
+        'trusttunnel_client.exe.\n'
+        'Expected location: $wintunPath',
+      );
+    }
+
+    // Confirm the app is running with administrator privileges.
+    // WFP (Windows Filtering Platform) requires admin; without it,
+    // FwpmTransactionBegin0 will fail with 0x5 (ERROR_ACCESS_DENIED).
+    final adminCheck = await Process.run(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        r'([Security.Principal.WindowsPrincipal]'
+            r'[Security.Principal.WindowsIdentity]::GetCurrent())'
+            r'.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)',
+      ],
+      runInShell: false,
+    ).catchError((_) => ProcessResult(0, 1, 'false', ''));
+
+    final isAdmin = adminCheck.stdout.toString().trim().toLowerCase() == 'true';
+    if (!isAdmin) {
+      throw Exception(
+        'TUN mode requires administrator privileges.\n'
+        'Please right-click trustunnel_pc.exe and choose '
+        '"Run as administrator", then try again.',
+      );
+    }
+  }
 
   /// Direct launch (no elevation needed: SOCKS5 mode, or Windows TUN via UAC).
   Future<void> _startDirect(String binaryPath) async {
@@ -867,8 +918,29 @@ wait "\$CHILD_PID"
         'socks=$host:$port',
         '/f'
       ]);
-      // Notify Windows that proxy settings changed.
-      await _run('rundll32.exe', ['wininet.dll,', 'ForceAutodiscovery']);
+      // Notify WinInet that proxy settings changed so running apps pick it up.
+      // ForceAutodiscovery is not a valid export; use InternetSetOption instead.
+      await _run('powershell', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-WindowStyle',
+        'Hidden',
+        '-Command',
+        r'''
+try {
+  Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WinInetHelper {
+    [DllImport("wininet.dll")]
+    public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);
+}
+"@
+  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+} catch {}
+''',
+      ]);
     }
   }
 
@@ -895,6 +967,28 @@ wait "\$CHILD_PID"
         '/d',
         '0',
         '/f'
+      ]);
+      // Notify WinInet that proxy settings changed.
+      await _run('powershell', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-WindowStyle',
+        'Hidden',
+        '-Command',
+        r'''
+try {
+  Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WinInetHelper {
+    [DllImport("wininet.dll")]
+    public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);
+}
+"@
+  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+} catch {}
+''',
       ]);
     }
   }
