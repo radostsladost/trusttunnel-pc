@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=TrustTunnel
+Exec=/opt/trusttunnel/trustunnel_pc
+Icon=trusttunnel
+Categories=Network;VPN;
+StartupWMClass=trusttunnel_pc

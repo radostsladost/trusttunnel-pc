@@ -1,0 +1,6 @@
+Package: trusttunnel-desktop
+Version: 1.0.0
+Architecture: amd64
+Maintainer: you@example.com
+Depends: libgtk-3-0, libayatana-appindicator3-1
+Description: TrustTunnel VPN desktop client
