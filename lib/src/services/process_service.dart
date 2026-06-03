@@ -57,6 +57,11 @@ class ProcessService {
   List<String> _macOsPreExistingUtun = []; // utun ifaces before we started
   final Map<String, List<String>> _macOsSavedDns = {}; // service→ original DNS
 
+  // Windows TUN networking state (routes managed by this app)
+  int? _winTunIfIndex; // interface index of the TrustTunnel wintun adapter
+  String? _winOriginalGateway; // default gateway before VPN
+  String? _winVpnServerIp; // resolved VPN server IP
+
   ListenerType? _activeListenerType;
   String _activeSocks5Address = '127.0.0.1:1080';
 
@@ -144,6 +149,14 @@ class ProcessService {
         _log('[APP] TUN network setup warning: $e');
       });
     }
+
+    // On Windows TUN mode: set up routing table to send traffic through the
+    // wintun adapter the binary created.
+    if (profile.listenerType == ListenerType.tun && Platform.isWindows) {
+      await _setupWindowsTunNetworking(profile).catchError((Object e) {
+        _log('[APP] Windows TUN network setup warning: $e');
+      });
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -179,6 +192,11 @@ class ProcessService {
     // On macOS TUN mode: restore DNS and remove routes we may have added.
     if (listenerType == ListenerType.tun && Platform.isMacOS) {
       await _teardownMacOsTunNetworking().catchError((_) {});
+    }
+
+    // On Windows TUN mode: remove the routes we added.
+    if (listenerType == ListenerType.tun && Platform.isWindows) {
+      await _teardownWindowsTunNetworking().catchError((_) {});
     }
 
     _log('[APP] Stopping VPN process...');
@@ -860,6 +878,223 @@ wait "\$CHILD_PID"
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Private – Windows TUN networking
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// After the binary connects, find the wintun adapter, save the current
+  /// default gateway, add a server-exception route and split-default routes
+  /// through the TUN interface so all traffic flows through the VPN.
+  Future<void> _setupWindowsTunNetworking(TrustTunnelProfile profile) async {
+    _log('[APP] Configuring Windows network for TUN mode…');
+
+    // 1. Poll for the TrustTunnel wintun adapter (up to 4 s).
+    _winTunIfIndex = await _findWindowsTunIfIndex();
+    if (_winTunIfIndex == null) {
+      _log(
+          '[APP] Warning: TrustTunnel adapter not found – routes not applied.');
+      return;
+    }
+    _log('[APP] TrustTunnel adapter ifIndex: $_winTunIfIndex');
+
+    // 2. Save the current default gateway.
+    _winOriginalGateway = await _getWindowsDefaultGateway();
+    if (_winOriginalGateway != null && _winOriginalGateway!.isNotEmpty) {
+      _log('[APP] Original default gateway: $_winOriginalGateway');
+    }
+
+    // 3. Resolve VPN server IP (so we can keep reaching it via the original gw).
+    _winVpnServerIp = await _resolveVpnServerIp(profile);
+    if (_winVpnServerIp != null) {
+      _log('[APP] VPN server IP: $_winVpnServerIp');
+    }
+
+    // 4. Check if the binary already installed a default route on this adapter.
+    final alreadyRouted = await _windowsTunHasDefaultRoute(_winTunIfIndex!);
+    if (alreadyRouted) {
+      _log('[APP] Default route already present on TUN adapter – skipping.');
+      return;
+    }
+
+    // 5. Get the TUN adapter’s assigned IP (needed as the next-hop).
+    final tunIp = await _getWindowsTunAdapterIp(_winTunIfIndex!);
+    if (tunIp == null) {
+      _log(
+          '[APP] Warning: could not determine TUN adapter IP – routes not applied.');
+      return;
+    }
+    _log('[APP] TUN adapter IP: $tunIp');
+
+    // 6. Apply routes.
+    await _applyWindowsTunRoutes(tunIp);
+  }
+
+  /// Polls `netsh interface ipv4 show interfaces` for up to 4 s until an
+  /// interface named "*TrustTunnel*" appears.  Returns its ifIndex, or null.
+  Future<int?> _findWindowsTunIfIndex() async {
+    for (var attempt = 0; attempt < 8; attempt++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      try {
+        final r = await Process.run(
+          'powershell',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            r"(Get-NetAdapter | Where-Object {$_.Name -like '*TrustTunnel*'} | Select-Object -First 1).ifIndex",
+          ],
+        );
+        final out = (r.stdout as String).trim();
+        final idx = int.tryParse(out);
+        if (idx != null) return idx;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  /// Returns the IPv4 address assigned to the given adapter interface index.
+  Future<String?> _getWindowsTunAdapterIp(int ifIndex) async {
+    try {
+      final r = await Process.run(
+        'powershell',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          '(Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 '
+              '-ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress',
+        ],
+      );
+      final ip = (r.stdout as String).trim();
+      return ip.isNotEmpty ? ip : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Returns the current IPv4 default gateway (before the VPN overrides it).
+  Future<String?> _getWindowsDefaultGateway() async {
+    try {
+      final r = await Process.run(
+        'powershell',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          r"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+              r"Sort-Object {$_.InterfaceMetric + $_.RouteMetric} | "
+              r"Select-Object -First 1).NextHop",
+        ],
+      );
+      final gw = (r.stdout as String).trim();
+      return (gw.isNotEmpty && gw != '0.0.0.0') ? gw : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Returns true if a 0.0.0.0/0 or 0.0.0.0/1+128.0.0.0/1 default route
+  /// already points at [ifIndex] (meaning the binary set it up itself).
+  Future<bool> _windowsTunHasDefaultRoute(int ifIndex) async {
+    try {
+      final r = await Process.run(
+        'powershell',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          '(Get-NetRoute -InterfaceIndex $ifIndex '
+              "-ErrorAction SilentlyContinue | Where-Object {"
+              r"$_.DestinationPrefix -eq '0.0.0.0/0' -or "
+              r"$_.DestinationPrefix -eq '0.0.0.0/1' -or "
+              r"$_.DestinationPrefix -eq '128.0.0.0/1'}).Count",
+        ],
+      );
+      final count = int.tryParse((r.stdout as String).trim()) ?? 0;
+      return count > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Adds:
+  ///   • A host route for the VPN server via the original gateway (loop
+  ///     prevention).
+  ///   • Two split-default routes (0.0.0.0/1 + 128.0.0.0/1) through [tunIp]
+  ///     with a low metric so they take precedence over the physical default.
+  Future<void> _applyWindowsTunRoutes(String tunIp) async {
+    final serverIp = _winVpnServerIp;
+    final origGw = _winOriginalGateway;
+
+    // Exception route: VPN server traffic must bypass the tunnel.
+    if (serverIp != null && origGw != null && origGw.isNotEmpty) {
+      final r = await Process.run('route', [
+        'add',
+        serverIp,
+        'mask',
+        '255.255.255.255',
+        origGw,
+        'METRIC',
+        '1',
+      ]);
+      if ((r.exitCode) == 0) {
+        _log('[APP] Server exception route added: $serverIp → $origGw');
+      } else {
+        _log('[APP] Server exception route warning: ${r.stderr}');
+      }
+    }
+
+    // Split-default routes through the TUN adapter.
+    for (final prefix in ['0.0.0.0', '128.0.0.0']) {
+      final r = await Process.run('route', [
+        'add',
+        prefix,
+        'mask',
+        '128.0.0.0',
+        tunIp,
+        'METRIC',
+        '5',
+      ]);
+      if (r.exitCode == 0) {
+        _log('[APP] Route added: $prefix/1 → $tunIp');
+      } else {
+        _log('[APP] Route add warning ($prefix/1): ${r.stderr}');
+      }
+    }
+  }
+
+  /// Removes the routes added by [_setupWindowsTunNetworking].
+  Future<void> _teardownWindowsTunNetworking() async {
+    final serverIp = _winVpnServerIp;
+    final origGw = _winOriginalGateway;
+
+    // Remove server exception route.
+    if (serverIp != null && origGw != null) {
+      await Process.run('route', [
+        'delete',
+        serverIp,
+        'mask',
+        '255.255.255.255',
+        origGw,
+      ]).catchError((_) => ProcessResult(0, 1, '', ''));
+    }
+
+    // Remove split-default routes.
+    for (final prefix in ['0.0.0.0', '128.0.0.0']) {
+      await Process.run('route', [
+        'delete',
+        prefix,
+        'mask',
+        '128.0.0.0',
+      ]).catchError((_) => ProcessResult(0, 1, '', ''));
+    }
+
+    _log('[APP] Windows TUN routes removed.');
+    _winTunIfIndex = null;
+    _winOriginalGateway = null;
+    _winVpnServerIp = null;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Private – system proxy management (SOCKS5 mode)
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -918,31 +1153,35 @@ wait "\$CHILD_PID"
         'socks=$host:$port',
         '/f'
       ]);
-      // Notify WinInet that proxy settings changed so running apps pick it up.
-      // ForceAutodiscovery is not a valid export; use InternetSetOption instead.
+      // Notify WinINet and broadcast WM_SETTINGCHANGE so all apps
+      // (including Chromium/Edge) immediately pick up the new proxy.
       await _run('powershell', [
         '-NoProfile',
         '-NonInteractive',
         '-WindowStyle',
         'Hidden',
         '-Command',
-        r'''
-try {
-  Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class WinInetHelper {
-    [DllImport("wininet.dll")]
-    public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);
-}
-"@
-  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
-  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
-} catch {}
-''',
+        _winProxyNotifyScript,
       ]);
     }
   }
+
+  // Single PowerShell script used by both _setSystemProxy and
+  // _clearSystemProxy to broadcast the proxy-changed notification.
+  static const String _winProxyNotifyScript = r'''
+try {
+  $s1 = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);'
+  Add-Type -MemberDefinition $s1 -Name WI -Namespace TT -ErrorAction SilentlyContinue
+  [TT.WI]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+  [TT.WI]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+} catch {}
+try {
+  $s2 = '[DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr result);'
+  Add-Type -MemberDefinition $s2 -Name U32 -Namespace TT -ErrorAction SilentlyContinue
+  $r = [UIntPtr]::Zero
+  [TT.U32]::SendMessageTimeout([IntPtr]0xFFFF, 0x1A, [UIntPtr]::Zero, "ProxySetting", 2, 5000, [ref]$r) | Out-Null
+} catch {}
+''';
 
   Future<void> _clearSystemProxy() async {
     _log('[APP] Clearing system proxy.');
@@ -968,27 +1207,13 @@ public class WinInetHelper {
         '0',
         '/f'
       ]);
-      // Notify WinInet that proxy settings changed.
       await _run('powershell', [
         '-NoProfile',
         '-NonInteractive',
         '-WindowStyle',
         'Hidden',
         '-Command',
-        r'''
-try {
-  Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class WinInetHelper {
-    [DllImport("wininet.dll")]
-    public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);
-}
-"@
-  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
-  [WinInetHelper]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
-} catch {}
-''',
+        _winProxyNotifyScript,
       ]);
     }
   }
