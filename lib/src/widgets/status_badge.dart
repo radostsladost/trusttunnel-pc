@@ -27,6 +27,7 @@ class StatusBadge extends StatelessWidget {
         ConnectionStatus.connecting => AppTheme.warning,
         ConnectionStatus.connected => AppTheme.success,
         ConnectionStatus.disconnecting => AppTheme.warning,
+        ConnectionStatus.reconnecting => AppTheme.warning,
         ConnectionStatus.error => AppTheme.error,
       };
 
@@ -35,12 +36,14 @@ class StatusBadge extends StatelessWidget {
         ConnectionStatus.connecting => 'Connecting...',
         ConnectionStatus.connected => 'Connected',
         ConnectionStatus.disconnecting => 'Disconnecting...',
+        ConnectionStatus.reconnecting => 'Reconnecting...',
         ConnectionStatus.error => 'Error',
       };
 
   bool get _pulsing =>
       status == ConnectionStatus.connecting ||
-      status == ConnectionStatus.disconnecting;
+      status == ConnectionStatus.disconnecting ||
+      status == ConnectionStatus.reconnecting;
 
   bool get _connected => status == ConnectionStatus.connected;
 

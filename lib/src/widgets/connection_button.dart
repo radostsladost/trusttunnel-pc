@@ -88,7 +88,8 @@ class _ConnectionButtonState extends State<ConnectionButton>
   void _syncAnimations() {
     final s = widget.status;
     if (s == ConnectionStatus.connecting ||
-        s == ConnectionStatus.disconnecting) {
+        s == ConnectionStatus.disconnecting ||
+        s == ConnectionStatus.reconnecting) {
       _rotCtrl.repeat();
       _pulseCtrl.stop();
       _pulseCtrl.reset();
@@ -131,6 +132,10 @@ class _ConnectionButtonState extends State<ConnectionButton>
             inner: AppTheme.warning,
             outer: const Color(0xFFB45309),
           ),
+        ConnectionStatus.reconnecting => (
+            inner: AppTheme.warning,
+            outer: const Color(0xFFB45309),
+          ),
         ConnectionStatus.error => (
             inner: AppTheme.error,
             outer: const Color(0xFF9F1239),
@@ -142,11 +147,13 @@ class _ConnectionButtonState extends State<ConnectionButton>
         ConnectionStatus.connecting => 'CONNECTING',
         ConnectionStatus.connected => 'CONNECTED',
         ConnectionStatus.disconnecting => 'DISCONNECTING',
+        ConnectionStatus.reconnecting => 'RECONNECTING',
         ConnectionStatus.error => 'ERROR',
       };
 
   String _lowerLabel() => switch (widget.status) {
         ConnectionStatus.connected => 'TAP TO DISCONNECT',
+        ConnectionStatus.reconnecting => 'TAP TO CANCEL',
         ConnectionStatus.error => 'TAP TO RETRY',
         _ => '',
       };
@@ -154,13 +161,15 @@ class _ConnectionButtonState extends State<ConnectionButton>
   bool get _interactive =>
       widget.status == ConnectionStatus.disconnected ||
       widget.status == ConnectionStatus.connected ||
+      widget.status == ConnectionStatus.reconnecting ||
       widget.status == ConnectionStatus.error;
 
   void _handleTap() {
     if (widget.status == ConnectionStatus.disconnected ||
         widget.status == ConnectionStatus.error) {
       widget.onConnect?.call();
-    } else if (widget.status == ConnectionStatus.connected) {
+    } else if (widget.status == ConnectionStatus.connected ||
+        widget.status == ConnectionStatus.reconnecting) {
       widget.onDisconnect?.call();
     }
   }
@@ -229,9 +238,10 @@ class _ConnectionButtonState extends State<ConnectionButton>
                           ),
                         ),
 
-                      // ── Rotating arc (connecting / disconnecting) ────────
+                      // ── Rotating arc (connecting / disconnecting / reconnecting) ──
                       if (widget.status == ConnectionStatus.connecting ||
-                          widget.status == ConnectionStatus.disconnecting)
+                          widget.status == ConnectionStatus.disconnecting ||
+                          widget.status == ConnectionStatus.reconnecting)
                         Transform.rotate(
                           angle: _rotCtrl.value * 2 * math.pi,
                           child: CustomPaint(

@@ -213,7 +213,9 @@ enum ConnectionStatus {
   connecting,
   connected,
   disconnecting,
+  reconnecting, // lost connection, waiting for network to come back
   error;
 
-  bool get isActive => this == connecting || this == connected;
+  bool get isActive =>
+      this == connecting || this == connected || this == reconnecting;
 }

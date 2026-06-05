@@ -95,6 +95,7 @@ class TrayService with TrayListener {
         ConnectionStatus.connecting => 'Connecting…',
         ConnectionStatus.disconnected => 'Disconnected',
         ConnectionStatus.disconnecting => 'Disconnecting…',
+        ConnectionStatus.reconnecting => 'Reconnecting…',
         ConnectionStatus.error => 'Error',
       };
 

@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../models/profile.dart';
+import 'elevated_task_service.dart';
+import 'http_bridge_service.dart';
 import 'storage_service.dart';
 import 'toml_service.dart';
 
@@ -64,6 +66,8 @@ class ProcessService {
 
   ListenerType? _activeListenerType;
   String _activeSocks5Address = '127.0.0.1:1080';
+  String _activeSocks5Username = '';
+  String _activeSocks5Password = '';
 
   final StreamController<String> _logController =
       StreamController<String>.broadcast();
@@ -111,6 +115,8 @@ class ProcessService {
 
     _activeListenerType = profile.listenerType;
     _activeSocks5Address = profile.socks5Address;
+    _activeSocks5Username = profile.socks5Username;
+    _activeSocks5Password = profile.socks5Password;
 
     // Launch the process.
     final needsElevation = profile.listenerType == ListenerType.tun &&
@@ -253,6 +259,10 @@ class ProcessService {
   /// Verifies that the current process has administrator privileges and that
   /// wintun.dll is present next to the binary.  Throws a human-readable
   /// [Exception] if either requirement is not met so the UI can surface it.
+  ///
+  /// If the app is not elevated but the "elevated launch" scheduled task is
+  /// registered, the app automatically relaunches via the task (no UAC prompt)
+  /// and exits the current non-elevated instance.
   Future<void> _checkWindowsTunPrerequisites(String binaryPath) async {
     // Check for wintun.dll in the same directory as the binary.
     final binDir = File(binaryPath).parent.path;
@@ -269,25 +279,22 @@ class ProcessService {
     // Confirm the app is running with administrator privileges.
     // WFP (Windows Filtering Platform) requires admin; without it,
     // FwpmTransactionBegin0 will fail with 0x5 (ERROR_ACCESS_DENIED).
-    final adminCheck = await Process.run(
-      'powershell',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        r'([Security.Principal.WindowsPrincipal]'
-            r'[Security.Principal.WindowsIdentity]::GetCurrent())'
-            r'.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)',
-      ],
-      runInShell: false,
-    ).catchError((_) => ProcessResult(0, 1, 'false', ''));
-
-    final isAdmin = adminCheck.stdout.toString().trim().toLowerCase() == 'true';
+    final isAdmin = await ElevatedTaskService.isElevated();
     if (!isAdmin) {
+      // If the one-time elevated task has been registered, relaunch via it
+      // — the new instance will be elevated with zero UAC prompts.
+      if (await ElevatedTaskService.isRegistered()) {
+        _log('[APP] Not elevated — relaunching via scheduled task…');
+        await ElevatedTaskService.relaunchElevated();
+        // relaunchElevated() calls exit(0), so nothing below executes.
+        return;
+      }
+
       throw Exception(
-        'TUN mode requires administrator privileges.\n'
-        'Please right-click trustunnel_pc.exe and choose '
-        '"Run as administrator", then try again.',
+        'TUN mode requires administrator privileges.\n\n'
+        'To avoid UAC prompts permanently:\n'
+        '  Settings → Windows Elevation → Set up elevated launch.\n\n'
+        'Or right-click trustunnel_pc.exe → Run as administrator.',
       );
     }
   }
@@ -563,7 +570,7 @@ wait "\$CHILD_PID"
   }
 
   void _watchExit(Process process) {
-    process.exitCode.then((code) {
+    process.exitCode.then((code) async {
       _log('[PROCESS] Exited with code $code');
       if (identical(process, _process)) {
         _process = null;
@@ -571,6 +578,23 @@ wait "\$CHILD_PID"
         // If the binary exited on its own, clean up the macOS log tail too.
         _macOsTailProcess?.kill();
         _macOsTailProcess = null;
+
+        // On unexpected exit, tear down any routes / proxy we own so the
+        // OS is left in a clean state while the app decides whether to
+        // reconnect.
+        final listenerType = _activeListenerType;
+        if (listenerType == ListenerType.tun) {
+          if (Platform.isMacOS) {
+            await _teardownMacOsTunNetworking().catchError((_) {});
+          } else if (Platform.isWindows) {
+            await _teardownWindowsTunNetworking().catchError((_) {});
+          }
+        } else if (listenerType == ListenerType.socks5) {
+          // Stop the HTTP bridge so its port is freed; leave the system proxy
+          // registry entry pointing to the (now-dead) ports so traffic fails
+          // closed rather than bypassing the proxy while we reconnect.
+          await HttpBridgeService.instance.stop().catchError((_) {});
+        }
       }
     });
   }
@@ -1129,6 +1153,26 @@ wait "\$CHILD_PID"
             'networksetup', ['-setsocksfirewallproxystate', iface, 'on']);
       }
     } else if (Platform.isWindows) {
+      // Start the HTTP CONNECT bridge so apps that only support HTTP proxy
+      // (not SOCKS5) are also routed through the VPN tunnel.
+      // The bridge always passes hostnames to the SOCKS5 server, giving
+      // SOCKS5H semantics and preventing DNS leaks.
+      final socks5Port = int.tryParse(port) ?? 1080;
+      final bridgePort = await HttpBridgeService.instance.start(
+        socks5Host: host,
+        socks5Port: socks5Port,
+        username: _activeSocks5Username,
+        password: _activeSocks5Password,
+      );
+      _log('[APP] HTTP bridge started on port $bridgePort');
+
+      // ProxyServer format: protocol=host:port;...  — use all three so that
+      // WinINet/WinHTTP apps use SOCKS5 natively while other apps (e.g. some
+      // .NET, Java, corporate tools) can fall back to HTTP CONNECT.
+      final proxyString = 'socks=$host:$port;'
+          'http=127.0.0.1:$bridgePort;'
+          'https=127.0.0.1:$bridgePort';
+
       const key =
           r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings';
       await _run('reg', [
@@ -1150,7 +1194,7 @@ wait "\$CHILD_PID"
         '/t',
         'REG_SZ',
         '/d',
-        'socks=$host:$port',
+        proxyString,
         '/f'
       ]);
       // Notify WinINet and broadcast WM_SETTINGCHANGE so all apps
@@ -1194,6 +1238,10 @@ try {
             'networksetup', ['-setsocksfirewallproxystate', iface, 'off']);
       }
     } else if (Platform.isWindows) {
+      // Stop the HTTP bridge before clearing the registry so no new
+      // connections arrive after the proxy is disabled.
+      await HttpBridgeService.instance.stop().catchError((_) {});
+
       const key =
           r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings';
       await _run('reg', [

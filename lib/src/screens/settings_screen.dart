@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
+import 'dart:io';
 
 import '../theme/app_theme.dart';
 import '../models/proxy_config.dart';
@@ -9,6 +10,7 @@ import '../providers/connection_provider.dart';
 import '../providers/installer_provider.dart';
 import '../providers/proxy_provider.dart';
 import '../services/autostart_service.dart';
+import '../services/elevated_task_service.dart';
 import '../services/installer_service.dart';
 import '../services/storage_service.dart';
 import '../widgets/neon_card.dart';
@@ -434,7 +436,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
             const SizedBox(height: 24),
 
-            // ── Global DNS Routes File section ──────────────────────────────
+            // ── Windows Elevation section (Windows only) ──────────────────
+            if (Platform.isWindows) ..._buildWindowsElevationCard(context),
+
+            // ── Global DNS Routes File section ────────────────────────
             NeonCard(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -578,6 +583,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
+  // ── Windows Elevation card ─────────────────────────────────
+
+  List<Widget> _buildWindowsElevationCard(BuildContext context) {
+    return [
+      const _WindowsElevationCard(),
+      const SizedBox(height: 24),
+    ];
+  }
+
   Future<void> _pickGlobalRoutesFile() async {
     final result = await FilePicker.platform.pickFiles(
       dialogTitle: 'Select DNS routes file',
@@ -615,6 +629,159 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           .read(installerProvider.notifier)
           .install(customInstallDir: result);
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Windows Elevation Card
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _WindowsElevationCard extends StatefulWidget {
+  const _WindowsElevationCard();
+
+  @override
+  State<_WindowsElevationCard> createState() => _WindowsElevationCardState();
+}
+
+class _WindowsElevationCardState extends State<_WindowsElevationCard> {
+  bool? _registered; // null = loading
+  bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final v = await ElevatedTaskService.isRegistered();
+    if (mounted) setState(() => _registered = v);
+  }
+
+  Future<void> _setup() async {
+    setState(() => _loading = true);
+    try {
+      await ElevatedTaskService.register();
+      if (mounted) {
+        setState(() {
+          _registered = true;
+          _loading = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+            'Done! From now on TrustTunnel launches elevated with no UAC prompt.',
+          ),
+          duration: Duration(seconds: 4),
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loading = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Setup failed: $e'),
+          backgroundColor: AppTheme.error,
+          duration: const Duration(seconds: 5),
+        ));
+      }
+    }
+  }
+
+  Future<void> _remove() async {
+    setState(() => _loading = true);
+    await ElevatedTaskService.unregister();
+    await Future.delayed(const Duration(milliseconds: 600));
+    await _refresh();
+    if (mounted) setState(() => _loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final registered = _registered;
+
+    return NeonCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'WINDOWS ELEVATION',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.textSecondary,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Register a one-time scheduled task so TrustTunnel launches elevated '
+            'without a UAC prompt on every start.\n'
+            'Only needed for TUN (System VPN) mode.',
+            style: TextStyle(fontSize: 13, color: AppTheme.textSecondary),
+          ),
+          const SizedBox(height: 12),
+
+          // Status row
+          Row(
+            children: [
+              Icon(
+                registered == true
+                    ? Icons.verified_rounded
+                    : Icons.info_outline_rounded,
+                size: 18,
+                color: registered == true ? AppTheme.success : AppTheme.warning,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                registered == null
+                    ? 'Checking…'
+                    : registered
+                        ? 'Elevated task is registered – no UAC on launch'
+                        : 'Not set up – UAC prompt required for TUN mode',
+                style: TextStyle(
+                  fontSize: 13,
+                  color:
+                      registered == true ? AppTheme.success : AppTheme.warning,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 12),
+
+          // Action buttons
+          Row(
+            children: [
+              if (registered != true)
+                GradientButton(
+                  label: 'Set up (one-time UAC)',
+                  icon: Icons.shield_rounded,
+                  height: 40,
+                  loading: _loading,
+                  onPressed: (_loading || registered == null) ? null : _setup,
+                ),
+              if (registered == true) ...[
+                GradientButton(
+                  label: 'Remove',
+                  icon: Icons.delete_outline_rounded,
+                  height: 40,
+                  loading: _loading,
+                  onPressed: _loading ? null : _remove,
+                ),
+                const SizedBox(width: 12),
+                TextButton(
+                  onPressed: _loading ? null : _refresh,
+                  child: const Text(
+                    'Refresh',
+                    style: TextStyle(color: AppTheme.textSecondary),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
   }
 }
 
