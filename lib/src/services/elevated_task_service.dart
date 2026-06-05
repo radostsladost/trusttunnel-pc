@@ -1,35 +1,41 @@
 import 'dart:io';
 
-/// Manages a Windows Task Scheduler task that runs TrustTunnel with
-/// `HighestAvailable` privileges — eliminating per-launch UAC prompts.
+/// Windows-only: manages a Task Scheduler task that runs TrustTunnel with
+/// `HighestAvailable` privileges, eliminating per-launch UAC prompts.
 ///
-/// ## How it works
+/// ## Elevation mechanism
 ///
-/// Windows Task Scheduler can run a task elevated on behalf of the current
-/// user WITHOUT a UAC prompt, because the privilege is granted once when the
-/// task is *registered*.  After registration:
+/// The previous PowerShell approach (`Start-Process -Verb RunAs` inside a
+/// `-NonInteractive` shell) silently fails on many systems because
+/// `-NonInteractive` can block Windows from showing the UAC consent dialog.
 ///
-///   - `schtasks /run /tn TrustTunnel_Elevated` launches the app elevated.
-///   - No UAC dialog appears for the user.
+/// This implementation uses **`wscript.exe` + `Shell.Application.ShellExecute`
+/// with the `"runas"` verb** — the same mechanism used by Windows installers
+/// and tools like Chocolatey.  It works because:
+///
+///   1. `wscript.exe` is always available and is not subject to PowerShell
+///      execution-policy restrictions.
+///   2. `Shell.Application.ShellExecute` invokes the shell's own elevation
+///      path, which always produces the UAC prompt regardless of the calling
+///      process's interactivity mode.
+///   3. `ShellExecute` is fire-and-forget (returns before schtasks finishes),
+///      so we poll `schtasks /query` until the task appears.
 ///
 /// ## Lifecycle
 ///
-/// 1. [register] — writes a task XML, then starts an elevated PowerShell
-///    to call `Register-ScheduledTask`.  UAC appears **once**.
-/// 2. From then on, [relaunchElevated] is called whenever TUN mode is
-///    requested but the current process is not yet elevated.  It fires
-///    `schtasks /run`, waits briefly, and calls `exit(0)` on the current
-///    (non-elevated) instance.  The user sees the app reopen immediately,
-///    with no UAC prompt.
-/// 3. [unregister] — removes the task (UAC appears once to delete it).
+/// 1. [register] — writes a task XML + a tiny VBScript, runs the VBScript
+///    with `wscript /nologo`.  UAC appears **once**.  Polls for up to 30 s.
+/// 2. [relaunchElevated] — calls `schtasks /run`, waits ~800 ms for the
+///    elevated instance to open, then calls `exit(0)`.  No UAC.
+/// 3. [unregister] — same VBScript pattern; polls until the task is gone.
 class ElevatedTaskService {
   ElevatedTaskService._();
 
   static const String _taskName = 'TrustTunnel_Elevated';
 
-  // ── Queries ─────────────────────────────────────────────────────────────────
+  // ── Queries ──────────────────────────────────────────────────────────────────
 
-  /// Returns true if the elevated task is registered for this user.
+  /// Returns `true` if the elevated scheduled task exists for this user.
   static Future<bool> isRegistered() async {
     if (!Platform.isWindows) return false;
     final r = await Process.run(
@@ -40,107 +46,124 @@ class ElevatedTaskService {
     return r.exitCode == 0;
   }
 
-  /// Returns true if the current process is already running as Administrator.
+  /// Returns `true` if the current process is already elevated (admin token).
+  ///
+  /// Uses `whoami /groups` and checks for the High Mandatory Level SID
+  /// (`S-1-16-12288`), which only appears in an elevated token.
+  /// Much faster than spawning PowerShell.
   static Future<bool> isElevated() async {
-    if (!Platform.isWindows) return true; // not relevant on other platforms
-    final r = await Process.run(
-      'powershell',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        r'([Security.Principal.WindowsPrincipal]'
-            r'[Security.Principal.WindowsIdentity]::GetCurrent())'
-            r'.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)',
-      ],
-      runInShell: false,
-    ).catchError((_) => ProcessResult(0, 1, 'false', ''));
-    return r.stdout.toString().trim().toLowerCase() == 'true';
+    if (!Platform.isWindows) return true;
+    try {
+      final r = await Process.run(
+        'whoami',
+        ['/groups'],
+        runInShell: false,
+      );
+      // S-1-16-12288 = High Integrity Level = elevated administrator.
+      return r.stdout.toString().contains('S-1-16-12288');
+    } catch (_) {
+      return false;
+    }
   }
 
   // ── Registration ─────────────────────────────────────────────────────────────
 
-  /// Registers the scheduled task.  Shows a UAC prompt **once**.
+  /// Registers the scheduled task.  Triggers a UAC prompt **exactly once**.
   ///
-  /// Throws if the user cancels UAC or if registration fails.
+  /// Throws a descriptive [Exception] if the task is not created within 30 s
+  /// (user declined UAC or something went wrong).
   static Future<void> register() async {
     if (!Platform.isWindows) return;
 
     final exePath = Platform.resolvedExecutable;
     final tmp = Directory.systemTemp.path;
     final xmlPath = '$tmp\\tt_task.xml';
-    final ps1Path = '$tmp\\tt_register.ps1';
+    final vbsPath = '$tmp\\tt_elevate.vbs';
 
-    // Write the task XML (UTF-8 is fine for Register-ScheduledTask).
+    // ── Step 1: write the task definition ────────────────────────────────────
     await File(xmlPath).writeAsString(_buildTaskXml(exePath));
 
-    // Write a small helper script that PowerShell will execute elevated.
-    // Using a file avoids quoting nightmares when embedding XML in -Command.
-    await File(ps1Path).writeAsString(
-      r'$xml = [System.IO.File]::ReadAllText($args[0]);'
-      'Register-ScheduledTask -Xml \$xml -TaskName "$_taskName" -Force;',
+    // ── Step 2: write a VBScript that elevates schtasks via ShellExecute ─────
+    //
+    // In VBScript string literals, two consecutive double-quotes ("") represent
+    // a single literal double-quote character.  That gives schtasks the
+    // properly-quoted /xml and /tn values it needs.
+    //
+    // The paths themselves can contain backslashes; VBScript does NOT treat
+    // backslash as an escape character inside strings, so no extra escaping
+    // is needed for directory separators.
+    final xmlQ = xmlPath.replaceAll('"', '""'); // escape any quotes in path
+    final vbs = StringBuffer()
+      ..writeln('Set sh = CreateObject("Shell.Application")')
+      ..write('sh.ShellExecute "schtasks.exe", ')
+      ..write('"/create /xml ""$xmlQ"" /tn ""$_taskName"" /f", ')
+      ..writeln('"", "runas", 1');
+
+    await File(vbsPath).writeAsString(vbs.toString());
+
+    // ── Step 3: run wscript ───────────────────────────────────────────────────
+    //
+    // wscript launches ShellExecute and returns immediately.
+    // The UAC dialog appears asynchronously from Windows (consent.exe).
+    // We must poll because we have no synchronous completion signal.
+    await Process.run('wscript', ['/nologo', vbsPath], runInShell: false)
+        .catchError((_) => ProcessResult(0, 0, '', ''));
+
+    // ── Step 4: poll until the task appears (up to 30 s) ─────────────────────
+    for (var i = 0; i < 60; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (await isRegistered()) {
+        _deleteFiles([xmlPath, vbsPath]);
+        return; // success
+      }
+    }
+
+    _deleteFiles([xmlPath, vbsPath]);
+    throw Exception(
+      'The scheduled task was not created after 30 seconds.\n\n'
+      'Possible causes:\n'
+      '  • You clicked "No" (or dismissed) the UAC prompt.\n'
+      '  • UAC is disabled by Group Policy on this machine.\n'
+      '  • Windows Script Host (wscript.exe) is disabled by policy.\n\n'
+      'Workaround: right-click trustunnel_pc.exe → Run as administrator, '
+      'then try again from Settings.',
     );
-
-    // Launch elevated PowerShell (UAC appears once here).
-    final result = await Process.run(
-      'powershell',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        'Start-Process powershell '
-            '-Verb RunAs '
-            '-Wait '
-            '-ArgumentList "-NoProfile -NonInteractive -File \\"$ps1Path\\" \\"$xmlPath\\""',
-      ],
-      runInShell: false,
-    ).catchError((_) => ProcessResult(0, 1, '', ''));
-
-    // Clean up temp files.
-    for (final p in [xmlPath, ps1Path]) {
-      File(p).delete().catchError((_) => File(p));
-    }
-
-    if (result.exitCode != 0) {
-      throw Exception(
-        'Could not register the elevated task (exit ${result.exitCode}).\n'
-        'Make sure you clicked "Yes" in the UAC prompt.',
-      );
-    }
-
-    // Verify it actually got created.
-    if (!await isRegistered()) {
-      throw Exception(
-        'Task registration appeared to succeed but the task was not found.\n'
-        'Try running the app as Administrator once, then set it up again.',
-      );
-    }
   }
 
-  /// Removes the scheduled task.  Shows a UAC prompt once.
+  // ── Unregistration ───────────────────────────────────────────────────────────
+
+  /// Removes the scheduled task.  Triggers a UAC prompt once.
   static Future<void> unregister() async {
     if (!Platform.isWindows) return;
-    await Process.run(
-      'powershell',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        'Start-Process schtasks '
-            '-Verb RunAs '
-            '-Wait '
-            '-ArgumentList "/delete /tn $_taskName /f"',
-      ],
-      runInShell: false,
-    ).catchError((_) => ProcessResult(0, 1, '', ''));
+
+    final vbsPath = '${Directory.systemTemp.path}\\tt_unreg.vbs';
+    final vbs = StringBuffer()
+      ..writeln('Set sh = CreateObject("Shell.Application")')
+      ..write('sh.ShellExecute "schtasks.exe", ')
+      ..write('"/delete /tn ""$_taskName"" /f", ')
+      ..writeln('"", "runas", 1');
+
+    await File(vbsPath).writeAsString(vbs.toString());
+
+    await Process.run('wscript', ['/nologo', vbsPath], runInShell: false)
+        .catchError((_) => ProcessResult(0, 0, '', ''));
+
+    // Poll until the task is gone (up to 10 s).
+    for (var i = 0; i < 20; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (!await isRegistered()) break;
+    }
+
+    _deleteFiles([vbsPath]);
   }
 
-  // ── Relaunch ────────────────────────────────────────────────────────────────
+  // ── Relaunch ─────────────────────────────────────────────────────────────────
 
   /// Fires the scheduled task (elevated, no UAC) and exits the current
   /// non-elevated process.
   ///
-  /// The user will see the app reopen within ~1 second, already elevated.
+  /// Task Scheduler launches a new elevated instance within ~1 s; the user
+  /// sees the app reopen without any dialog.
   static Future<void> relaunchElevated() async {
     await Process.run(
       'schtasks',
@@ -148,17 +171,25 @@ class ElevatedTaskService {
       runInShell: false,
     ).catchError((_) => ProcessResult(0, 1, '', ''));
 
-    // Give Task Scheduler a moment to spin up the new instance before we
-    // disappear, so there is no visible gap in the app window.
+    // Give Task Scheduler a moment to spin up the elevated window before
+    // we close so the user doesn't see a gap.
     await Future.delayed(const Duration(milliseconds: 800));
     exit(0);
   }
 
-  // ── XML builder ─────────────────────────────────────────────────────────────
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+
+  static void _deleteFiles(List<String> paths) {
+    for (final p in paths) {
+      File(p).delete().catchError((_) => File(p));
+    }
+  }
+
+  // ── Task XML ─────────────────────────────────────────────────────────────────
 
   static String _buildTaskXml(String exePath) {
-    // Escape characters that are special in XML.
-    final escaped = exePath
+    // Escape characters reserved in XML attribute/element values.
+    final esc = exePath
         .replaceAll('&', '&amp;')
         .replaceAll('"', '&quot;')
         .replaceAll('<', '&lt;')
@@ -173,8 +204,6 @@ class ElevatedTaskService {
   <Principals>
     <Principal id="Author">
       <LogonType>InteractiveToken</LogonType>
-      <!-- HighestAvailable = Admin if the user is in the Administrators group,
-           otherwise standard.  Avoids failures for non-admin accounts. -->
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
@@ -189,7 +218,7 @@ class ElevatedTaskService {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>$escaped</Command>
+      <Command>$esc</Command>
     </Exec>
   </Actions>
 </Task>''';
